@@ -1,0 +1,12 @@
+[Unit]
+Description=Oracle Worker
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/pg_worker
+ExecStart=/bin/sh -c 'python3 pg_worker.py'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

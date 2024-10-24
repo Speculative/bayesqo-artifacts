@@ -1,0 +1,145 @@
+- name: Setup PG workers
+  hosts: all
+  strategy: free
+
+  tasks:
+    - name: Copy authorized keys
+      ansible.builtin.copy:
+        src: authorized_keys
+        dest: /root/.ssh/authorized_keys
+        owner: root
+        group: root
+        mode: 0600
+      tags:
+        - auth
+    - name: Stop celery service
+      ansible.builtin.systemd:
+        name: celery
+        state: stopped
+        enabled: no
+      ignore_errors: true
+    - name: Stop celery-hipri service
+      ansible.builtin.systemd:
+        name: celery-hipri
+        state: stopped
+        enabled: no
+      ignore_errors: true
+    - name: Kill any current worker
+      shell: pkill -SIGINT -f celery
+      ignore_errors: true
+    - name: Stop any pg worker
+      ansible.builtin.systemd:
+        name: pg_worker
+        state: stopped
+        enabled: no
+      ignore_errors: true
+    - name: Ensure PG is installed
+      community.general.pacman:
+        name:
+          - postgresql
+          - python-typing_extensions
+          - python-celery
+          - python-psycopg
+          - python-dateutil
+          - base-devel
+          - llvm
+          - clang
+          - wget
+        state: present
+    - name: Download IMDb dump
+      ansible.builtin.get_url:
+        url: https://www.dropbox.com/scl/fi/om40x4ei836onfykip3y2/imdb_pg11?rlkey=nsu684o2ej9sc12ir008paj56&dl=1
+        dest: /root/imdb_pg11
+        checksum: sha1:7b1d8f1e21061f6e81afc86532dacbe75cb4dee2
+    - name: Download so_future dump
+      ansible.builtin.get_url:
+        url: https://www.dropbox.com/scl/fi/1g0c12ddzluxm4cd7d6hm/so_pg13?rlkey=y2lvoy9c9h1xcy8t0zi61yo0r&dl=1
+        dest: /root/so_pg13
+        checksum: sha1:e3eae21275bf88feb2f452785dc061ada0331cc0
+    - name: Download so_past dump
+      ansible.builtin.get_url:
+        url: https://www.dropbox.com/scl/fi/8yqt3jh9gds3v68nvazx8/so_past?rlkey=8ps7l54dxj6e1bgddbmeh43tw&dl=1
+        dest: /root/so_past
+        checksum: sha1:3e28ba5fcd575a9a0f69ce8166a8ac63d0fe76e9
+    - name: Copy pacman.conf
+      ansible.builtin.copy:
+        src: pacman.conf
+        dest: /etc/pacman.conf
+        owner: root
+        group: root
+        mode: u=rw,g=r,o=r
+    - name: Run IMDb install script if needed
+      ansible.builtin.script: ./setup_pg.sh
+      args:
+        creates: /var/lib/postgres/data/postgresql.conf
+    - name: Copy StackOverflow index creation script
+      ansible.builtin.copy:
+        src: configure_so_indexes.sql
+        dest: /root/configure_so_indexes.sql
+        owner: root
+        group: root
+        mode: u=rwx,g=rx,o=rx
+    - name: Configure so_future
+      ansible.builtin.script: ./setup_so_future.sh
+    - name: Configure so_past
+      ansible.builtin.script: ./setup_so_past.sh
+    - name: Install pg_hint_plan if needed
+      ansible.builtin.script: ./setup_pg_hint_plan.sh
+      args:
+        creates: /usr/share/postgresql/extension/pg_hint_plan.control
+    - name: Copy postgresql.conf
+      ansible.builtin.copy:
+        src: postgresql.conf
+        dest: /var/lib/postgres/data/postgresql.conf
+        owner: postgres
+        group: postgres
+        mode: u=rw,g=r,o=r
+    - name: make sure we have an override systemd dir for PG
+      ansible.builtin.file:
+        path: /etc/systemd/system/postgresql.service.d
+        state: directory
+    - name: systemd override to always restart PG
+      ansible.builtin.copy:
+        src: override.conf
+        dest: /etc/systemd/system/postgresql.service.d/override.conf
+        owner: root
+        group: root
+        mode: u=rw,g=r,o=r
+    - name: Restart and reload PostgreSQL
+      ansible.builtin.systemd_service:
+        state: restarted
+        daemon_reload: true
+        name: postgresql
+    - name: Make sure imdb is accepting connections
+      command: sudo -u postgres psql -c "ALTER DATABASE imdb WITH ALLOW_CONNECTIONS true"
+    - name: Make sure so_future is accepting connections
+      command: sudo -u postgres psql -c "ALTER DATABASE so_future WITH ALLOW_CONNECTIONS true"
+    - name: Make sure so_past is accepting connections
+      command: sudo -u postgres psql -c "ALTER DATABASE so_past WITH ALLOW_CONNECTIONS true"
+    - name: ANALYZE imdb
+      command: sudo -u postgres psql imdb -c "ANALYZE"
+    - name: ANALYZE so_future
+      command: sudo -u postgres psql so_future -c "ANALYZE"
+    - name: ANALYZE so_past
+      command: sudo -u postgres psql so_past -c "ANALYZE"
+    - name: Copy pg_worker source
+      ansible.builtin.copy:
+        src: ../pg_worker
+        dest: /root/
+    - name: Copy pg_worker service file
+      ansible.builtin.copy:
+        src: pg_worker.service
+        dest: /etc/systemd/system/pg_worker.service
+        owner: root
+        group: root
+        mode: u=rw,g=r,o=r
+    - name: Start pg worker service
+      ansible.builtin.systemd:
+        name: pg_worker
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+    - name: Turn off swap
+      ansible.builtin.command:
+        cmd: swapoff -a
+      ignore_errors: true

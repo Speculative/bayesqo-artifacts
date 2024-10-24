@@ -1,0 +1,14 @@
+- name: Copy authorized keys
+  hosts: all
+  strategy: free
+
+  tasks:
+    - name: Copy authorized keys
+      ansible.builtin.copy:
+        src: authorized_keys
+        dest: /root/.ssh/authorized_keys
+        owner: root
+        group: root
+        mode: 0600
+      tags:
+        - auth

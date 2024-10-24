@@ -1,0 +1,81 @@
+- name: Restart PG workers
+  hosts: hipri
+  strategy: free
+
+  tasks:
+    - name: Stop celery service
+      ansible.builtin.systemd:
+        name: celery
+        state: stopped
+        enabled: no
+      ignore_errors: true
+    - name: Stop celery-hipri service
+      ansible.builtin.systemd:
+        name: celery-hipri
+        state: stopped
+        enabled: no
+      ignore_errors: true
+    - name: Copy postgresql.conf
+      ansible.builtin.copy:
+        src: postgresql.conf
+        dest: /var/lib/postgres/data/postgresql.conf
+        owner: postgres
+        group: postgres
+        mode: u=rw,g=r,o=r
+    - name: Restart and reload PostgreSQL
+      ansible.builtin.systemd_service:
+        state: restarted
+        daemon_reload: true
+        name: postgresql
+    - name: Make sure imdb is accepting connections
+      command: sudo -u postgres psql -c "ALTER DATABASE imdb WITH ALLOW_CONNECTIONS true"
+    - name: Make sure so_future is accepting connections
+      command: sudo -u postgres psql -c "ALTER DATABASE so_future WITH ALLOW_CONNECTIONS true"
+    - name: Make sure so_past is accepting connections
+      command: sudo -u postgres psql -c "ALTER DATABASE so_past WITH ALLOW_CONNECTIONS true"
+    - name: ANALYZE imdb
+      command: sudo -u postgres psql imdb -c "ANALYZE"
+    - name: ANALYZE so_future
+      command: sudo -u postgres psql so_future -c "ANALYZE"
+    - name: ANALYZE so_past
+      command: sudo -u postgres psql so_past -c "ANALYZE"
+    - name: Copy pg_worker source
+      ansible.builtin.copy:
+        src: ../pg_worker
+        dest: /root/
+    - name: Write hostname to pg_worker
+      ansible.builtin.copy:
+        content: "{{ inventory_hostname }}"
+        dest: /root/pg_worker/hostname
+    - name: Copy celery.service
+      ansible.builtin.copy:
+        src: celery.service
+        dest: /etc/systemd/system/celery.service
+        owner: root
+        group: root
+        mode: u=rw,g=r,o=r
+    - name: Copy celery-hipri.service
+      ansible.builtin.copy:
+        src: celery-hipri.service
+        dest: /etc/systemd/system/celery-hipri.service
+        owner: root
+        group: root
+        mode: u=rw,g=r,o=r
+    - name: Start celery service
+      when: inventory_hostname in groups['workers']
+      ansible.builtin.systemd:
+        name: celery
+        state: started
+        enabled: yes
+        daemon_reload: yes
+    - name: Start celery-hipri service
+      when: inventory_hostname in groups['hipri']
+      ansible.builtin.systemd:
+        name: celery-hipri
+        state: started
+        enabled: yes
+        daemon_reload: yes
+    - name: Turn off swap
+      ansible.builtin.command:
+        cmd: swapoff -a
+      ignore_errors: true
