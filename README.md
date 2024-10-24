@@ -2,7 +2,7 @@
 
 - `/bayes_lqo`
   - `codec/codec.py`: Query plan language encoder/decoder (query plan -> string, string -> query plan)
-  - `workload`
+  - `workload/`
     - `ceb-3k/`: CEB workload
     - `job/`: JOB workload
       - `schema.sql`: Schema for JOB and CEB workloads
@@ -12,7 +12,7 @@
   - `oracle/`: Code for the black box oracle & DB cluster workers
     - `oracle.py`: Entry point for evaluating black box oracle function on the DB cluster
     - `pg_celery_worker/`:
-      - `pg_worker/`: Code for the DB worker service that executes queries in the queue
+      - `pg_worker/pg_worker.py`: Code for the DB worker service that executes queries in the queue
       - `ansible/`: DB cluster node configuration files
         - `postgresql.conf`: PostreSQL configuration used on DB cluster nodes
         - `setup_pg.sh`: Installs PostgreSQL, loads the IMDB dataset
@@ -23,7 +23,7 @@
     - `gen_alias_workload.py`: Generates random queries
     - `planner.py`: Plans queries (with varying hint sets) using PostgreSQL
     - `codec.py`: Encode generated plans as strings
-  - `db_eval`: Scripts to run baselines, generate plots
+  - `db_eval/`: Scripts to run baselines, generate plots
     - `random_plans.py`: Code for the "Random" baseline
     - `bao.py`: Code for the "Bao" baseline
   - `your_tasks/`: Code for defining objective functions for BO
