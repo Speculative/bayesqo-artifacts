@@ -1,6 +1,7 @@
 from enum import StrEnum, auto
 
 from peewee import (
+    AsIs,
     AutoField,
     Field,
     ForeignKeyField,
@@ -9,6 +10,8 @@ from peewee import (
     SqliteDatabase,
     TextField,
 )
+
+from logger.log import l
 
 db = SqliteDatabase("workload.db")
 

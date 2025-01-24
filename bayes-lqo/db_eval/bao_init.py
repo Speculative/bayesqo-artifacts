@@ -1,18 +1,22 @@
 import pdb
 import time
+from itertools import product
 from random import shuffle
+from statistics import median
 from subprocess import DEVNULL, run
 
 import typer
-from logger.log import l
-from oracle.oracle import _default_plan, _resolve_codec
-from oracle.pg_celery_worker.pg_worker import tasks
 from peewee import fn
+from psycopg import sql
+
+from logger.log import l
+from oracle.oracle import QueryTask, _default_plan, _resolve_codec
 from training_data.codec import build_join_tree
 from workload.workloads import OracleCodec, WorkloadSpec, get_workload_set
 
 from .bao import get_hints, ranked_hint_badness
-from .storage import BaoInitialization, PostgresPlan
+from .stack import workload_queries as stack_workload_queries
+from .storage import BaoInitialization, BaoJoinHint, BaoScanHint, PostgresPlan
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -31,7 +35,10 @@ def initialize_query(workload_set: str, query: str, prewarm_factor: int):
 
     postgres_best = (
         PostgresPlan.select(fn.MIN(PostgresPlan.runtime_secs))
-        .where((PostgresPlan.workload_set == workload_set) & (PostgresPlan.query_name == query))
+        .where(
+            (PostgresPlan.workload_set == workload_set)
+            & (PostgresPlan.query_name == query)
+        )
         .scalar()
     )
     if postgres_best is not None and postgres_best < best_seen:
@@ -40,7 +47,10 @@ def initialize_query(workload_set: str, query: str, prewarm_factor: int):
 
     existing_best = (
         BaoInitialization.select(fn.MIN(BaoInitialization.runtime_secs).alias("best"))
-        .where((BaoInitialization.workload_set == workload_set) & (BaoInitialization.query_name == query))
+        .where(
+            (BaoInitialization.workload_set == workload_set)
+            & (BaoInitialization.query_name == query)
+        )
         .scalar()
     )
     if existing_best is not None and existing_best < best_seen:
@@ -67,14 +77,15 @@ def initialize_query(workload_set: str, query: str, prewarm_factor: int):
         query_statements = hint_statements + [
             f"EXPLAIN (ANALYZE, FORMAT JSON, SETTINGS ON, TIMING OFF) {_default_plan(spec)}",
         ]
-        result = tasks.pg_execute_query.delay(
-            query_statements,
-            best_seen * 1000,
-            return_result=True,
+        sql = "; ".join(query_statements)
+        task = QueryTask(
+            sql,
+            timeout_ms=int(best_seen * 1000),
             db=workload_def_set.db,
-            db_user=workload_def_set.db_user,
-            prewarm_factor=prewarm_factor if best_seen < 60 else 0,
-        ).get()
+            user=workload_def_set.db_user,
+        )
+        task.submit()
+        result = task.result()
 
         # We do not record times for failed queries, but we'll need to redo them later
         if result["status"] == "failed":
@@ -88,16 +99,20 @@ def initialize_query(workload_set: str, query: str, prewarm_factor: int):
             best_seen = runtime_secs
         else:
             # Timed out queries still need EXPLAIN so we can record the encoded plan
-            result = tasks.pg_execute_query.delay(
-                hint_statements + [f"EXPLAIN (FORMAT JSON, SETTINGS ON) {_default_plan(spec)}"],
-                60 * 1000,
-                return_result=True,
+            sql = "; ".join(
+                hint_statements
+                + [f"EXPLAIN (FORMAT JSON, SETTINGS ON) {_default_plan(spec)}"]
+            )
+            task = QueryTask(
+                sql,
+                timeout_ms=60 * 1000,
                 db=workload_def_set.db,
-                db_user=workload_def_set.db_user,
-                prewarm_factor=0,
-            ).get()
+                user=workload_def_set.db_user,
+            )
+            task.submit()
+            result = task.result()
 
-        if "result" not in result:
+        if not "result" in result:
             pdb.set_trace()
         join_tree = build_join_tree(result["result"][0][0][0]["Plan"])
         codec_inst = _resolve_codec(workload)
@@ -136,12 +151,19 @@ def initialize_query(workload_set: str, query: str, prewarm_factor: int):
 def initialize_workload(
     workload_set: str = typer.Option(),
     prewarm_factor: int = typer.Option(0),
+    force_recheck: bool = typer.Option(False),
 ):
     workload_def_set = get_workload_set(workload_set)
     all_queries = list(workload_def_set.queries.keys())
     shuffle(all_queries)
     for query in all_queries:
-        if BaoInitialization.select().where(BaoInitialization.query_name == query).count() > 0:
+        if (
+            not force_recheck
+            and BaoInitialization.select()
+            .where(BaoInitialization.query_name == query)
+            .count()
+            > 0
+        ):
             continue
         initialize_query(workload_set, query, prewarm_factor)
 
@@ -156,7 +178,9 @@ def cancel_queries():
 
 
 @app.command()
-def concurrent_initialize(workload_set: str = typer.Option(), threads: int = typer.Option(8)):
+def concurrent_initialize(
+    workload_set: str = typer.Option(), threads: int = typer.Option(8)
+):
     workload_def_set = get_workload_set(workload_set)
     prioritized_hints = list(ranked_hint_badness())
     for query, spec_def in workload_def_set.queries.items():
@@ -179,7 +203,10 @@ def concurrent_initialize(workload_set: str = typer.Option(), threads: int = typ
                 == 0
             )
         ]
-        grouped_hints = [filtered_hints[i : i + threads] for i in range(0, len(filtered_hints), threads)]
+        grouped_hints = [
+            filtered_hints[i : i + threads]
+            for i in range(0, len(filtered_hints), threads)
+        ]
         l.info(f"Initializing {query}")
         best_seen = 10 * 60
         maybe_existing_best = (
@@ -192,7 +219,9 @@ def concurrent_initialize(workload_set: str = typer.Option(), threads: int = typ
         spec = WorkloadSpec.from_definition(spec_def, OracleCodec.Aliases)
         for hint_group in grouped_hints:
             # Dispatch this set of hints concurrently
-            l.info(f"Dispatching {query} ({len(hint_group)} hints), timeout {best_seen} secs")
+            l.info(
+                f"Dispatching {query} ({len(hint_group)} hints), timeout {best_seen} secs"
+            )
             futures = {}
             for join_hint, scan_hint in hint_group:
                 hint_statements = get_hints(join_hint, scan_hint)
@@ -262,13 +291,18 @@ def concurrent_initialize(workload_set: str = typer.Option(), threads: int = typ
                     continue
 
                 result = results.get((join_hint, scan_hint))
-                runtime_secs = result["duration (ns)"] / 1_000_000_000 if result is not None else best_seen
+                runtime_secs = (
+                    result["duration (ns)"] / 1_000_000_000
+                    if result is not None
+                    else best_seen
+                )
                 timed_out = result is None or result["status"] == "timeout"
                 if timed_out:
                     # Timed out queries still need EXPLAIN so we can record the encoded plan
                     hint_statements = get_hints(join_hint, scan_hint)
                     result = tasks.pg_execute_query_high.delay(
-                        hint_statements + [f"EXPLAIN (FORMAT JSON, SETTINGS ON) {_default_plan(spec)}"],
+                        hint_statements
+                        + [f"EXPLAIN (FORMAT JSON, SETTINGS ON) {_default_plan(spec)}"],
                         60 * 1000,
                         return_result=True,
                         db=workload_def_set.db,

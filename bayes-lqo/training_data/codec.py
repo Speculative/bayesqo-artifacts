@@ -1,8 +1,14 @@
 import csv
+import io
 import json
 import os
 import pdb
-from typing import Any
+from abc import ABC, abstractmethod
+from typing import Any, Optional
+
+import matplotlib.image as mpimg
+import matplotlib.pyplot as plt
+import networkx as nx  # type: ignore
 
 from codec.codec import (
     AliasesCodec,
@@ -11,6 +17,8 @@ from codec.codec import (
     JoinTree,
     JoinTreeBranch,
     JoinTreeLeaf,
+    StackMachineCodec,
+    StackMachineWithOperatorsCodec,
 )
 from logger.log import l
 from workload.schema import build_table_order
@@ -37,7 +45,7 @@ def resolve_join_operator(join_type: str) -> JoinOperator:
 
 
 def _build_join_tree(explain: dict) -> JoinTree | None:
-    if "Node Type" not in explain:
+    if not "Node Type" in explain:
         raise ValueError("Node without type?")
     match explain["Node Type"]:
         case "Nested Loop" | "Merge Join" | "Hash Join":
@@ -66,7 +74,7 @@ def _build_join_tree(explain: dict) -> JoinTree | None:
                         full_alias = full_alias.split(".", 1)[1]
                     alias = int(full_alias[len(table) :])
                     return JoinTreeLeaf(table, alias)
-                except:  # noqa: E722
+                except:
                     # pdb.set_trace()
                     # This is caused by subqueries, which should be explicitly excluded from the JoinTree
                     return None
@@ -152,7 +160,9 @@ def encode_plans(codec: Codec):
                     for plan_tree, perturbation_type in perturbations_for_plan:
                         encoded = codec.encode(plan_tree)
                         out = ",".join([str(symbol) for symbol in encoded])
-                        writer.writerow((plan.query_id, plan.plan_type, perturbation_type, out))
+                        writer.writerow(
+                            (plan.query_id, plan.plan_type, perturbation_type, out)
+                        )
 
                     variants += len(perturbations_for_plan)
                     total_seen += len(perturbations_for_plan)
@@ -160,7 +170,9 @@ def encode_plans(codec: Codec):
                     print("Somehow got a leaf plan?")
             # print(join_size, total_seen, end="\r")
 
-        print(f"Size {join_size}: {plans_of_size} postgres, {variants - plans_of_size} variants. ")
+        print(
+            f"Size {join_size}: {plans_of_size} postgres, {variants - plans_of_size} variants. "
+        )
         print(
             f"\t{' ' if join_size > 9 else ''}{left_deep} left deep, {right_deep} right deep, {zigzag} zigzag, {bushy} bushy"
         )
@@ -169,6 +181,8 @@ def encode_plans(codec: Codec):
 
 
 def encode_alias_plans(codec: Codec, schema: str, directory: str = "encoded"):
+    total_seen = 0
+
     os.makedirs(directory, exist_ok=True)
     for plan_type in PlanType:
         plans_of_size = 0
@@ -176,10 +190,14 @@ def encode_alias_plans(codec: Codec, schema: str, directory: str = "encoded"):
         right_deep = 0
         zigzag = 0
         bushy = 0
+        variants = 0
 
         total_plans = (
             AliasWorkloadPlan.select()
-            .where((AliasWorkloadPlan.plan_type == plan_type) & (AliasWorkloadPlan.schema == schema))
+            .where(
+                (AliasWorkloadPlan.plan_type == plan_type)
+                & (AliasWorkloadPlan.schema == schema)
+            )
             .count()
         )
 
@@ -190,7 +208,10 @@ def encode_alias_plans(codec: Codec, schema: str, directory: str = "encoded"):
             for plan in (
                 AliasWorkloadPlan.select()
                 .join(AliasWorkloadQuery)
-                .where((AliasWorkloadPlan.plan_type == plan_type) & (AliasWorkloadPlan.schema == schema))
+                .where(
+                    (AliasWorkloadPlan.plan_type == plan_type)
+                    & (AliasWorkloadPlan.schema == schema)
+                )
             ):
                 explain = json.loads(plan.plan_json)
                 if isinstance(explain, list):
@@ -198,12 +219,12 @@ def encode_alias_plans(codec: Codec, schema: str, directory: str = "encoded"):
                 join_tree = build_join_tree(explain["Plan"])
 
                 # Round trip encoding test
-                # try:
-                #     encoded = codec.encode(join_tree)
-                #     decoded = codec.decode(plan.query_id.join_key, encoded)
-                #     assert join_tree == decoded
-                # except:
-                #     pdb.set_trace()
+                try:
+                    encoded = codec.encode(join_tree)
+                    decoded = codec.decode(plan.query_id.join_key, encoded)
+                    assert join_tree == decoded
+                except:
+                    pdb.set_trace()
 
                 # Accounting, just for interesting statistics
                 plans_of_size += 1
@@ -238,14 +259,11 @@ def encode_alias_plans(codec: Codec, schema: str, directory: str = "encoded"):
                 if num_encoded % 1000 == 0:
                     l.info(f"{num_encoded}/{total_plans} encoded")
             # print(join_size, total_seen, end="\r")
-        l.info(f"{left_deep} left deep, {right_deep} right deep, {zigzag} zigzag, {bushy} bushy")
+        l.info(
+            f"{left_deep} left deep, {right_deep} right deep, {zigzag} zigzag, {bushy} bushy"
+        )
 
 
 if __name__ == "__main__":
-    # codec = StackMachineWithOperatorsCodec(
-    #     build_table_order("schema_fk.sql")
-    # )
-    # codec = StackMachineCodec(build_table_order("schema_fk.sql"))
-
-    codec = AliasesCodec(build_table_order("workload/stack/schema.sql"))
-    encode_alias_plans(codec, schema="STACK", directory="stack_encoded/so_future")
+    codec = AliasesCodec(build_table_order("workload/dsb/schema.sql"))
+    encode_alias_plans(codec, schema="DSB", directory="dsb_encoded")

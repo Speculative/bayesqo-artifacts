@@ -1,16 +1,17 @@
 import pdb
 import re
+import time
 from itertools import product
 from random import shuffle
 
 import typer
 import wandb  # type: ignore
+from logger.log import l
+from oracle.oracle import _default_plan, _resolve_codec
 from peewee import fn
 from tqdm import tqdm
 
-from logger.log import l
-from oracle.oracle import _default_plan, _resolve_codec
-from oracle.pg_celery_worker.pg_worker import tasks
+# from oracle.pg_celery_worker.pg_worker import tasks
 from training_data.codec import build_join_tree
 from workload.workloads import (
     OracleCodec,
@@ -25,6 +26,7 @@ from .storage import (
     BaoJoinHint,
     BaoPlan,
     BaoScanHint,
+    PostgresPlan,
     StackBaoInitialization,
     StackBayesBestPlan,
     StackWorkload,
@@ -61,6 +63,8 @@ def execute_with_hints(
 ):
     hint_statements = get_hints(join_hint, scan_hint)
     query_statements = hint_statements + [_default_plan(spec)]
+    # TODO: BROKEN
+    assert False
     result = tasks.pg_execute_query_high.delay(
         sql=query_statements,
         timeout=10 * 60 * 1000,
@@ -150,6 +154,8 @@ def disk_test(query: str = typer.Option()):
     spec = workload_def_set.queries[query]
     query_sql = _default_plan(spec)
     while True:
+        # TODO: BROKEN
+        assert False
         run_solo = tasks.pg_execute_query_high.delay(
             sql=query_sql,
             timeout=60 * 1000,
@@ -223,6 +229,13 @@ def show_workload_queries(
         )
         print(f"{query}: {runtime:.2f}")
     print(f"Total queries: {len(queries)}")
+    template_counts = {}
+    for query in queries:
+        template = template_name(query)
+        if template not in template_counts:
+            template_counts[template] = 0
+        template_counts[template] += 1
+    print(f"n is {max(template_counts.values())}")
 
 
 def initialize_query(workload_set: str, query: str, prewarm_factor: int):
@@ -273,6 +286,8 @@ def initialize_query(workload_set: str, query: str, prewarm_factor: int):
         ]
 
         # First, check if this exact plan has already been run
+        # TODO: BROKEN
+        assert False
         explain_result = tasks.pg_execute_query_high.delay(
             hint_statements
             + [f"EXPLAIN (FORMAT JSON, SETTINGS ON) {_default_plan(spec)}"],
@@ -313,6 +328,8 @@ def initialize_query(workload_set: str, query: str, prewarm_factor: int):
         if skip:
             continue
 
+        # TODO: BROKEN
+        assert False
         result = tasks.pg_execute_query_high.delay(
             query_statements,
             best_seen * 1000,
@@ -334,6 +351,8 @@ def initialize_query(workload_set: str, query: str, prewarm_factor: int):
             best_seen = runtime_secs
         else:
             # Timed out queries still need EXPLAIN so we can record the encoded plan
+            # TODO: BROKEN
+            assert False
             result = tasks.pg_execute_query_high.delay(
                 hint_statements
                 + [f"EXPLAIN (FORMAT JSON, SETTINGS ON) {_default_plan(spec)}"],
@@ -344,7 +363,7 @@ def initialize_query(workload_set: str, query: str, prewarm_factor: int):
                 prewarm_factor=0,
             ).get()
 
-        if "result" not in result:
+        if not "result" in result:
             pdb.set_trace()
         join_tree = build_join_tree(result["result"][0][0][0]["Plan"])
         codec_inst = _resolve_codec(workload)
@@ -560,6 +579,27 @@ def past_plan_on_future():
     for query in all_queries:
         for join_hint, scan_hint in product(list(BaoJoinHint), list(BaoScanHint)):
             pass
+
+
+@app.command()
+def populate_bao(version: str = "SO_FUTURE"):
+    queries = workload_queries(200, 1.0)
+    shuffle(queries)
+    for query in queries:
+        join_hint = BaoJoinHint.NoHint
+        scan_hint = BaoScanHint.NoHint
+        existing = (
+            BaoPlan.select()
+            .where(
+                (BaoPlan.query_name == query)
+                & (BaoPlan.join_hint == join_hint)
+                & (BaoPlan.scan_hint == scan_hint)
+            )
+            .count()
+        )
+        if existing > 0:
+            continue
+        bao_sample(query, join_hint, scan_hint, workload_set=version)
 
 
 if __name__ == "__main__":

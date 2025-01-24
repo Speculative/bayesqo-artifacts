@@ -9,12 +9,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import typer  # type: ignore
+from peewee import Select, fn
 from tqdm import tqdm
+
 from workload.workloads import get_workload_set
 
 from .bao import bao_optimal_time, postgres_time
 from .bayes import InitType, bayes_series
 from .random_plans import all_random_series
+from .storage import BaoJoinHint, BaoPlan, BaoScanHint, PostgresPlan, RandomPlan, db
 from .utils import AGG_FUNCS, Aggregate, compact_time, pretty_time
 
 app = typer.Typer(no_args_is_help=True)
@@ -47,10 +50,15 @@ def best_overall(optimization_series: list[list[tuple[float, float]]]) -> float:
     """Given multiple series of optimizations, returns the best time
     achieved across all series.
     """
-    return min(min(plan_runtime for _, plan_runtime in series) for series in optimization_series)
+    return min(
+        min(plan_runtime for _, plan_runtime in series)
+        for series in optimization_series
+    )
 
 
-def best_at_time(optimization_series: list[list[tuple[float, float]]], time: float) -> Optional[float]:
+def best_at_time(
+    optimization_series: list[list[tuple[float, float]]], time: float
+) -> Optional[float]:
     """Given a particular time, returns the best plan runtime achieved"""
     best_seen = None
     seen_any = False
@@ -79,7 +87,9 @@ def average_with_error(
 ) -> tuple[list[float], list[float], list[float]]:
     series = [s for s in series if s[0][0] < time_step_secs]
     last_time = max(run[-1][0] for run in series)
-    times = list(float(t) for t in range(time_step_secs, int(ceil(last_time)), time_step_secs))
+    times = list(
+        float(t) for t in range(time_step_secs, int(ceil(last_time)), time_step_secs)
+    )
     means = []
     errors = []
     for time in times:
@@ -175,7 +185,9 @@ def time_vs_best(
     plt.gca().yaxis.set_minor_formatter(mpl.ticker.ScalarFormatter())
     plt.gca().set_xticks([0, 3600, 2 * 3600, 3 * 3600, 4 * 3600, 5 * 3600, 6 * 3600])
     plt.gca().set_xlim(0, 5 * 3600)
-    plt.gca().xaxis.set_major_formatter(mpl.ticker.FuncFormatter(lambda x, _: compact_time(x)))
+    plt.gca().xaxis.set_major_formatter(
+        mpl.ticker.FuncFormatter(lambda x, _: compact_time(x))
+    )
     plt.title(
         f"{query} comparison of optimization strategies",
         fontfamily="Arvo",
@@ -332,7 +344,7 @@ def plot_best_overall(
 
     df = pd.DataFrame(times, index=idx)
     df.plot.bar()
-    plt.title("Best plan runtime for each query")
+    plt.title(f"Best plan runtime for each query")
     plt.ylabel("Plan runtime (s)")
     plt.xlabel("Query")
     plt.show()
@@ -368,16 +380,23 @@ def plot_geomean_per_time(
                 postgres = postgres_time(query)
                 if bayes_best is None:
                     bayes_best = postgres
-                bayes_bao_improvement[i].append(min(bayes_best, bao_optimal_time(query, workload_set)) / postgres)
+                bayes_bao_improvement[i].append(
+                    min(bayes_best, bao_optimal_time(query, workload_set)) / postgres
+                )
             observed_queries.append(query)
         except ValueError:
             tqdm.write(f"Skipping {query}")
     tqdm.write(f"Saw {len(observed_queries)} / {len(workload_set_obj.queries)} queries")
 
     bao_geo = geometric_mean(
-        [(bao_optimal_time(query, workload_set) / postgres_time(query)) for query in observed_queries]
+        [
+            (bao_optimal_time(query, workload_set) / postgres_time(query))
+            for query in observed_queries
+        ]
     )
-    plt.axhline(y=bao_geo, label="Bao", color="green", linestyle="--", zorder=4, linewidth=1)
+    plt.axhline(
+        y=bao_geo, label="Bao", color="green", linestyle="--", zorder=4, linewidth=1
+    )
 
     bayes_bao_means = [geometric_mean(points) for points in bayes_bao_improvement]
     plt.plot(
@@ -400,7 +419,9 @@ def plot_geomean_per_time(
     plt.grid(axis="x", zorder=0)
     plt.legend()
 
-    plt.title("Geometric mean improvement over PostgreSQL", fontfamily="Arvo", fontsize=16)
+    plt.title(
+        "Geometric mean improvement over PostgreSQL", fontfamily="Arvo", fontsize=16
+    )
     plt.ylabel("Geometric mean proportional runtime")
     plt.xlabel("Wall clock time (hours)")
     plt.tight_layout()
@@ -432,7 +453,9 @@ def plot_improvement_histogram(
 ):
     workload_set_obj = get_workload_set(workload_set)
     bayes_improvement = []
-    for query in tqdm(workload_set_obj.queries, desc="Queries", position=1, leave=False):
+    for query in tqdm(
+        workload_set_obj.queries, desc="Queries", position=1, leave=False
+    ):
         try:
             bayes = bayes_series(query, inits, cross_joins)
             bayes_best = best_at_time(bayes, time)
@@ -501,20 +524,26 @@ def plot_improvement_histogram(
             f"plots/improvement_histogram/{'cross_joins' if cross_joins else 'no_cross_joins'}/{'_'.join(sorted(inits))}",
         )
         os.makedirs(target_dir, exist_ok=True)
-        plt.savefig(os.path.join(target_dir, f"{time}.png"), dpi=400, bbox_inches="tight")
+        plt.savefig(
+            os.path.join(target_dir, f"{time}.png"), dpi=400, bbox_inches="tight"
+        )
         plt.close()
     else:
         plt.show()
 
 
 @app.command()
-def plot_all_improvement_histograms(workload_set: str = typer.Option(), cross_joins: bool = False):
+def plot_all_improvement_histograms(
+    workload_set: str = typer.Option(), cross_joins: bool = False
+):
     for time in tqdm(
         [5 * i * 60 for i in range(1, (16 * 60) // 5)],
         desc="Histograms",
         position=0,
     ):
-        plot_improvement_histogram(workload_set, time, cross_joins=cross_joins, save=True)
+        plot_improvement_histogram(
+            workload_set, time, cross_joins=cross_joins, save=True
+        )
 
 
 @app.command()
@@ -536,8 +565,12 @@ def compare_workloads():
             except ValueError:
                 # tqdm.write(f"Skipping {query}")
                 pass
-        tqdm.write(f"Average oracle calls for {workload_set}: {total_oracle_calls / runs}")
-        tqdm.write(f"Median oracle calls for {workload_set}: {median(oracle_call_points)}")
+        tqdm.write(
+            f"Average oracle calls for {workload_set}: {total_oracle_calls / runs}"
+        )
+        tqdm.write(
+            f"Median oracle calls for {workload_set}: {median(oracle_call_points)}"
+        )
 
 
 if __name__ == "__main__":

@@ -1,14 +1,20 @@
 import json
-from itertools import combinations
+import pdb
+import time
+from itertools import combinations, islice
+from pprint import pformat
 from typing import Iterable
 
+import matplotlib.pyplot as plt  # type: ignore
 import networkx as nx  # type: ignore
-from logger.log import l
-from peewee import JOIN, chunked
+from peewee import JOIN, AsIs, IntegrityError, chunked
 from sqlglot import Expression, condition, select  # type: ignore
-from workload.schema import build_join_graph
 
-from .planner import explain_batch
+from logger.log import l
+from workload.schema import build_join_graph, build_join_graph_from_queries
+from workload.workloads import get_workload_set
+
+from .planner import explain_batch, get_explain
 from .storage import PlanType, QueryType, WorkloadPlan, WorkloadQuery
 
 
@@ -28,7 +34,9 @@ def join_tables(join_graph: nx.Graph, length: int) -> Iterable[list[str]]:
             yield list(join_candidate)
 
 
-def join_edges(join_graph: nx.Graph, join_tables: list[str]) -> list[tuple[tuple[str, str], tuple[str, str]]]:
+def join_edges(
+    join_graph: nx.Graph, join_tables: list[str]
+) -> list[tuple[tuple[str, str], tuple[str, str]]]:
     """
     Find all join edges ((table1, col1), (table2, col2)) given the `join_graph` and the list of
     `join_tables`
@@ -46,7 +54,9 @@ def join_edges(join_graph: nx.Graph, join_tables: list[str]) -> list[tuple[tuple
     return edges
 
 
-def make_join_expr(tables: list[str], edges: list[tuple[tuple[str, str], tuple[str, str]]]) -> Expression:
+def make_join_expr(
+    tables: list[str], edges: list[tuple[tuple[str, str], tuple[str, str]]]
+) -> Expression:
     """Make a SQLGlot equi-join query given the `tables` and `edges` of the join."""
     expr = select("*").from_(tables[0])
 
@@ -71,7 +81,9 @@ def generate_queries(join_graph: nx.Graph):
         all_joins = list(join_tables(join_graph, join_size))
 
         l.info(f"There are {len(all_joins)} joins of size {join_size}")
-        existing = WorkloadQuery.select().where(WorkloadQuery.num_joins == join_size).count()
+        existing = (
+            WorkloadQuery.select().where(WorkloadQuery.num_joins == join_size).count()
+        )
         if existing == len(all_joins):
             l.info(f"All plain join queries of size {join_size} already present")
             continue
@@ -94,15 +106,28 @@ def generate_queries(join_graph: nx.Graph):
             )
         inserted = 0
         for batch in chunked(to_insert, 1000):
-            inserted += WorkloadQuery.insert_many(batch).on_conflict_ignore().as_rowcount().execute()
-            l.info(f"Join Size {join_size}: {round((inserted / len(all_joins)) * 100)}% of queries")
-        l.info(f"Wrote {inserted}/{len(all_joins)} plain join queries of size {join_size}")
+            inserted += (
+                WorkloadQuery.insert_many(batch)
+                .on_conflict_ignore()
+                .as_rowcount()
+                .execute()
+            )
+            l.info(
+                f"Join Size {join_size}: {round((inserted / len(all_joins)) * 100)}% of queries"
+            )
+        l.info(
+            f"Wrote {inserted}/{len(all_joins)} plain join queries of size {join_size}"
+        )
 
 
 def generate_plans(plan_type: PlanType):
     for join_size in range(2, 18):
         PlansOfType = WorkloadPlan.alias()
-        plans_of_type = PlansOfType.select().where(PlansOfType.plan_type == plan_type).cte("plans_of_type")
+        plans_of_type = (
+            PlansOfType.select()
+            .where(PlansOfType.plan_type == plan_type)
+            .cte("plans_of_type")
+        )
 
         unplanned_queries = (
             WorkloadQuery.select(WorkloadQuery.query_id, WorkloadQuery.sql_text)
@@ -111,10 +136,15 @@ def generate_plans(plan_type: PlanType):
                 JOIN.LEFT_OUTER,
                 on=(WorkloadQuery.query_id == plans_of_type.c.query_id),
             )
-            .where((WorkloadQuery.num_joins == join_size) & (plans_of_type.c.plan_json is None))
+            .where(
+                (WorkloadQuery.num_joins == join_size)
+                & (plans_of_type.c.plan_json == None)
+            )
             .with_cte(plans_of_type)
         )
-        l.info(f"Total unplanned {plan_type} queries for join size {join_size}: {len(unplanned_queries)}")
+        l.info(
+            f"Total unplanned {plan_type} queries for join size {join_size}: {len(unplanned_queries)}"
+        )
 
         inserted = 0
         for batch in chunked(unplanned_queries, 100):
@@ -131,32 +161,21 @@ def generate_plans(plan_type: PlanType):
                 }
                 for (query, explain) in zip(batch, explains)
             ]
-            inserted += WorkloadPlan.insert_many(to_insert).on_conflict_ignore().as_rowcount().execute()
-            l.info(f"{round((inserted / len(unplanned_queries)) * 100)}% planned for join size {join_size}")
+            inserted += (
+                WorkloadPlan.insert_many(to_insert)
+                .on_conflict_ignore()
+                .as_rowcount()
+                .execute()
+            )
+            l.info(
+                f"{round((inserted / len(unplanned_queries)) * 100)}% planned for join size {join_size}"
+            )
 
 
 if __name__ == "__main__":
-    join_graph = build_join_graph("schema_fk.sql")
-    # generate_queries(join_graph)
+    dsb_workload_set = get_workload_set("DSB")
+    join_graph = dsb_workload_set.join_graph
+    generate_queries(join_graph)
 
-    for plan_type in PlanType:
-        generate_plans(plan_type)
-
-# results = (
-#     WorkloadQuery.select()
-#     .join(WorkloadPlan, JOIN.LEFT_OUTER)
-#     .where((WorkloadQuery.num_joins == 13) & (WorkloadPlan.plan_json == None))
-# )
-# l.info(len(results))
-
-# for join_size in range(7, 11):
-#     start = time.time()
-#     for query in []:
-#         if (explained := get_explain(sql)) is not None:
-#             pass
-#             # store_plan(json.dumps(explained), query_id)
-#             # l.debug(explained)
-#     end = time.time()
-#     l.info(
-#         f"Planned {len(all_joins)} joins of size {join_size} in {end - start} seconds."
-#     )
+    # for plan_type in PlanType:
+    #     generate_plans(plan_type)

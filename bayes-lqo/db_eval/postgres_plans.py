@@ -1,9 +1,16 @@
+import pdb
+import re
+import time
+from multiprocessing import Pool, Queue
+from random import shuffle
+
 import typer
+from peewee import fn
+
 from logger.log import l
 from oracle.oracle import _default_plan
 from oracle.pg_celery_worker.pg_worker import tasks
-from peewee import fn
-from workload.workloads import IMDB_WORKLOAD_SET
+from workload.workloads import IMDB_WORKLOAD_SET, get_workload_set
 
 from .storage import PostgresPlan
 from .utils import JOB_QUERIES_SORTED
@@ -43,14 +50,18 @@ def summarize():
     for query in JOB_QUERIES_SORTED:
         count = PostgresPlan.select().where(PostgresPlan.query_name == query).count()
         average = (
-            PostgresPlan.select(fn.AVG(PostgresPlan.runtime_secs)).where(PostgresPlan.query_name == query).scalar()
+            PostgresPlan.select(fn.AVG(PostgresPlan.runtime_secs))
+            .where(PostgresPlan.query_name == query)
+            .scalar()
         ) or 0
         print(f"{query}: {count} samples, avg {average:.2f} secs")
 
 
 def postgres_time(query: str):
     postgres_avg = (
-        PostgresPlan.select(fn.AVG(PostgresPlan.runtime_secs)).where(PostgresPlan.query_name == query).scalar()
+        PostgresPlan.select(fn.AVG(PostgresPlan.runtime_secs))
+        .where(PostgresPlan.query_name == query)
+        .scalar()
     )
 
     return postgres_avg

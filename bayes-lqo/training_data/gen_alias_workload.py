@@ -1,12 +1,24 @@
 import json
+import os
+import pdb
+import time
 from itertools import combinations, pairwise
 from pprint import pformat
+from typing import Iterable
 
+import matplotlib.pyplot as plt  # type: ignore
 import networkx as nx  # type: ignore
 import sqlglot
-from logger.log import l
-from peewee import JOIN, chunked
+from peewee import JOIN, AsIs, IntegrityError, chunked
 from sqlglot import Expression, condition, select  # type: ignore
+
+from logger.log import l
+from workload.schema import (
+    build_alias_join_graph,
+    build_join_graph,
+    build_join_graph_from_queries,
+)
+from workload.workloads import get_workload_set
 
 from .planner import explain_batch
 from .storage import AliasWorkloadPlan, AliasWorkloadQuery, PlanType, QueryType
@@ -38,7 +50,9 @@ def make_join_expr(
 ) -> Expression:
     """Make a SQLGlot equi-join query given the `tables` and `edges` of the join."""
     first_table, first_alias = tables[0]
-    expr = select("*").from_(sqlglot.expressions.alias_(first_table, f"{first_table}{first_alias}"))
+    expr = select("*").from_(
+        sqlglot.expressions.alias_(first_table, f"{first_table}{first_alias}")
+    )
 
     for table, alias in tables[1:]:
         expr = expr.join(sqlglot.expressions.alias_(table, f"{table}{alias}"))
@@ -74,14 +88,16 @@ def gen_alias_join_queries(join_graph: nx.Graph, schema_name: str):
             current_alias: dict[str, int] = {table: 1 for table, _ in path}
             alias_rewrites: dict[tuple[str, int], int] = {}
             for table, alias_num in path:
-                if (table, alias_num) not in alias_rewrites:
+                if not (table, alias_num) in alias_rewrites:
                     alias_rewrites[(table, alias_num)] = current_alias[table]
                     current_alias[table] += 1
                 normalized_path.append((table, alias_rewrites[(table, alias_num)]))
 
             # Get join edges from path
             seen_edges = set()
-            edges: list[tuple[tuple[tuple[str, int], str], tuple[tuple[str, int], str]]] = []
+            edges: list[
+                tuple[tuple[tuple[str, int], str], tuple[tuple[str, int], str]]
+            ] = []
             for table_alias_1, table_alias_2 in pairwise(normalized_path):
                 # We don't need to add the same join edge twice
                 # This happens if the path loops back on itself
@@ -121,8 +137,8 @@ def gen_alias_join_queries(join_graph: nx.Graph, schema_name: str):
             join_expr = make_join_expr(deduped_path, edges)
 
             num_joins = len(deduped_path)
-            if tuple(deduped_path) not in unique_queries:
-                if num_joins not in queries_of_length:
+            if not tuple(deduped_path) in unique_queries:
+                if not num_joins in queries_of_length:
                     queries_of_length[num_joins] = 0
                 queries_of_length[num_joins] += 1
 
@@ -130,7 +146,7 @@ def gen_alias_join_queries(join_graph: nx.Graph, schema_name: str):
             unique_queries.add(tuple(reversed(deduped_path)))
 
             num_aliases = max(alias_rewrites.values())
-            if num_aliases not in queries_with_alias_count:
+            if not num_aliases in queries_with_alias_count:
                 queries_with_alias_count[num_aliases] = 0
             queries_with_alias_count[num_aliases] += 1
 
@@ -145,10 +161,19 @@ def gen_alias_join_queries(join_graph: nx.Graph, schema_name: str):
                 }
             )
 
-        inserted = AliasWorkloadQuery.insert_many(to_insert).on_conflict_ignore().as_rowcount().execute()
+        inserted = (
+            AliasWorkloadQuery.insert_many(to_insert)
+            .on_conflict_ignore()
+            .as_rowcount()
+            .execute()
+        )
         to_insert = []
 
-        total_queries = AliasWorkloadQuery.select().where(AliasWorkloadQuery.schema == schema_name).count()
+        total_queries = (
+            AliasWorkloadQuery.select()
+            .where(AliasWorkloadQuery.schema == schema_name)
+            .count()
+        )
         l.info(f"{inserted} new queries, {total_queries} total")
 
     l.info(f"Unique queries by length: {pformat(queries_of_length)}")
@@ -165,13 +190,17 @@ def generate_plans(plan_type: PlanType, schema: str):
     )
 
     unplanned_queries = (
-        AliasWorkloadQuery.select(AliasWorkloadQuery.query_id, AliasWorkloadQuery.sql_text)
+        AliasWorkloadQuery.select(
+            AliasWorkloadQuery.query_id, AliasWorkloadQuery.sql_text
+        )
         .join(
             plans_of_type,
             JOIN.LEFT_OUTER,
             on=(AliasWorkloadQuery.query_id == plans_of_type.c.query_id),
         )
-        .where((AliasWorkloadQuery.schema == schema) & (plans_of_type.c.plan_json is None))
+        .where(
+            (AliasWorkloadQuery.schema == schema) & (plans_of_type.c.plan_json == None)
+        )
         .with_cte(plans_of_type)
     )
     l.info(f"Total unplanned {plan_type} queries: {len(unplanned_queries)}")
@@ -192,8 +221,15 @@ def generate_plans(plan_type: PlanType, schema: str):
             }
             for (query, explain) in zip(batch, explains)
         ]
-        inserted += AliasWorkloadPlan.insert_many(to_insert).on_conflict_ignore().as_rowcount().execute()
-        l.info(f"{round((inserted / len(unplanned_queries)) * 100, 2)}% planned {plan_type}")
+        inserted += (
+            AliasWorkloadPlan.insert_many(to_insert)
+            .on_conflict_ignore()
+            .as_rowcount()
+            .execute()
+        )
+        l.info(
+            f"{round((inserted / len(unplanned_queries)) * 100, 2)}% planned {plan_type}"
+        )
 
 
 if __name__ == "__main__":
@@ -202,6 +238,11 @@ if __name__ == "__main__":
     # )
     # aliased_join_graph = build_alias_join_graph(join_graph, 3)
     # gen_alias_join_queries(aliased_join_graph, "STACK")
+    # for plan_type in PlanType:
+    #     generate_plans(plan_type, "STACK")
 
+    dsb_workload_set = get_workload_set("DSB")
+    aliased_join_graph = build_alias_join_graph(dsb_workload_set.join_graph, 3)
+    # gen_alias_join_queries(aliased_join_graph, "DSB")
     for plan_type in PlanType:
-        generate_plans(plan_type, "STACK")
+        generate_plans(plan_type, "DSB")

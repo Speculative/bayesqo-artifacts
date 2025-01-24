@@ -1,10 +1,13 @@
 from enum import StrEnum, auto
 
 from peewee import (
+    AsIs,
     AutoField,
     BooleanField,
+    DateTimeField,
     Field,
     FloatField,
+    ForeignKeyField,
     IntegerField,
     Model,
     SqliteDatabase,
@@ -219,6 +222,38 @@ class StackBayesBestPlan(BaseModel):
         indexes = ((("query_name", "init", "cross_joins", "language"), False),)
 
 
+class BayesValidationRun(BaseModel):
+    id = AutoField(primary_key=True)
+    run_name = TextField()
+    workload_set = TextField()
+    query_name = TextField()
+    encoded_plan = EncodedPlanField()
+    runtime_secs = FloatField()
+
+    class Meta:
+        indexes = ((("query_name",), False),)
+
+
+class StackShiftedOptimizedPlan(BaseModel):
+    id = AutoField(primary_key=True)
+    shifted_to = DateTimeField()
+    query_name = TextField()
+    plan_version = TextField()
+    encoded_plan = EncodedPlanField()
+    runtime_secs = FloatField()
+
+    class Meta:
+        indexes = (
+            (
+                (
+                    "shifted_to",
+                    "query_name",
+                ),
+                False,
+            ),
+        )
+
+
 db.connect()
 db.create_tables(
     [
@@ -232,5 +267,7 @@ db.create_tables(
         StackWorkloadTimeout,
         StackBaoInitialization,
         StackBayesBestPlan,
+        BayesValidationRun,
+        StackShiftedOptimizedPlan,
     ]
 )

@@ -1,17 +1,19 @@
+import pdb
 import re
 from itertools import product
 from random import shuffle
 from statistics import median
 
 import typer
-from logger.log import l
-from oracle.oracle import _default_plan, _resolve_codec
-from oracle.pg_celery_worker.pg_worker import tasks
 from peewee import fn
+from psycopg import sql
+
+from logger.log import l
+from oracle.oracle import QueryTask, _default_plan, _resolve_codec
 from training_data.codec import build_join_tree
 from workload.workloads import OracleCodec, WorkloadSpec, get_workload_set
 
-from .storage import BaoJoinHint, BaoPlan, BaoScanHint
+from .storage import BaoInitialization, BaoJoinHint, BaoPlan, BaoScanHint, PostgresPlan
 from .utils import JOB_QUERIES_SORTED
 
 app = typer.Typer(no_args_is_help=True)
@@ -80,14 +82,18 @@ def sample(
     db_user = "imdb"
     if workload_set in ["SO_FUTURE", "SO_PAST"]:
         db_user = "so"
-    result = tasks.pg_execute_query_high.delay(
-        query_statements,
-        20 * 60 * 1000,
-        return_result=True,
+
+    sql = "; ".join(query_statements)
+    task = QueryTask(
+        sql,
+        10 * 60 * 1000,
         db=db,
-        db_user=db_user,
-        prewarm_factor=1,
-    ).get()
+        user=db_user,
+    )
+    task.submit()
+    result = task.result()
+    if result is None:
+        raise ValueError("Somehow got a None result from the task!")
 
     if result["status"] == "timeout":
         l.warning(f"Query for {query} timed out")
@@ -96,7 +102,7 @@ def sample(
         l.error(f"Query for {query} failed: {result['message']}")
         return
 
-    if "result" not in result:
+    if not "result" in result:
         l.error("Worker did not return a result!")
     join_tree = build_join_tree(result["result"][0][0][0]["Plan"])
     codec_inst = _resolve_codec(workload)
@@ -124,7 +130,9 @@ def fill(samples: int = 5, workload_set: str = typer.Option("JOB")):
             existing = (
                 BaoPlan.select()
                 .where(
-                    (BaoPlan.query_name == query) & (BaoPlan.join_hint == join_hint) & (BaoPlan.scan_hint == scan_hint)
+                    (BaoPlan.query_name == query)
+                    & (BaoPlan.join_hint == join_hint)
+                    & (BaoPlan.scan_hint == scan_hint)
                 )
                 .count()
             )
@@ -156,18 +164,24 @@ def summarize(workload_set: str = typer.Option("JOB")):
             count = (
                 BaoPlan.select()
                 .where(
-                    (BaoPlan.query_name == query) & (BaoPlan.join_hint == join_hint) & (BaoPlan.scan_hint == scan_hint)
+                    (BaoPlan.query_name == query)
+                    & (BaoPlan.join_hint == join_hint)
+                    & (BaoPlan.scan_hint == scan_hint)
                 )
                 .count()
             )
             average = (
                 BaoPlan.select(fn.AVG(BaoPlan.runtime_secs))
                 .where(
-                    (BaoPlan.query_name == query) & (BaoPlan.join_hint == join_hint) & (BaoPlan.scan_hint == scan_hint)
+                    (BaoPlan.query_name == query)
+                    & (BaoPlan.join_hint == join_hint)
+                    & (BaoPlan.scan_hint == scan_hint)
                 )
                 .scalar()
             ) or 0
-            print(f"\t{join_hint}, {scan_hint}: {count} samples, avg {average:.2f} secs")
+            print(
+                f"\t{join_hint}, {scan_hint}: {count} samples, avg {average:.2f} secs"
+            )
 
 
 def bao_optimal_time(query: str, workload_set: str) -> float:
@@ -186,30 +200,65 @@ def bao_optimal_time(query: str, workload_set: str) -> float:
         .from_(average_runtimes)
         .first()
     )
-    if result is None:
-        raise ValueError(f"No Bao optimal time found for {query} in {workload_set}")
+    if result.min_runtime is not None:
+        return result.min_runtime
 
-    return result.min_runtime
-
-
-def hint_performance(query: str, join_hint: BaoJoinHint, scan_hint: BaoScanHint) -> float:
-    return (
-        BaoPlan.select(fn.AVG(BaoPlan.runtime_secs))
-        .where((BaoPlan.query_name == query) & (BaoPlan.join_hint == join_hint) & (BaoPlan.scan_hint == scan_hint))
+    result = (
+        BaoInitialization.select(fn.MIN(BaoInitialization.runtime_secs))
+        .where(
+            (BaoInitialization.query_name == query)
+            & (BaoInitialization.workload_set == workload_set)
+        )
         .scalar()
     )
+    if result is not None:
+        return result
+
+    raise ValueError(f"No Bao optimal time found for {query} in {workload_set}")
 
 
-def postgres_time(query: str) -> float:
+def hint_performance(
+    query: str, join_hint: BaoJoinHint, scan_hint: BaoScanHint
+) -> float:
     return (
         BaoPlan.select(fn.AVG(BaoPlan.runtime_secs))
         .where(
             (BaoPlan.query_name == query)
+            & (BaoPlan.join_hint == join_hint)
+            & (BaoPlan.scan_hint == scan_hint)
+        )
+        .scalar()
+    )
+
+
+def postgres_time(query: str, workload_set: str) -> float:
+    pg_time = (
+        BaoPlan.select(fn.AVG(BaoPlan.runtime_secs))
+        .where(
+            (BaoPlan.query_name == query)
+            & (BaoPlan.workload_set == workload_set)
             & (BaoPlan.join_hint == BaoJoinHint.NoHint)
             & (BaoPlan.scan_hint == BaoScanHint.NoHint)
         )
         .scalar()
     )
+    if pg_time is not None:
+        return pg_time
+
+    maybe_censored_pg_time = (
+        BaoInitialization.select(BaoInitialization.runtime_secs)
+        .where(
+            (BaoInitialization.query_name == query)
+            & (BaoInitialization.workload_set == workload_set)
+            & (BaoInitialization.join_hint == BaoJoinHint.NoHint)
+            & (BaoInitialization.scan_hint == BaoScanHint.NoHint)
+        )
+        .scalar()
+    )
+    if maybe_censored_pg_time is not None:
+        return maybe_censored_pg_time
+
+    return None
     # return (
     #     PostgresPlan.select(fn.AVG(PostgresPlan.runtime_secs))
     #     .where(PostgresPlan.query_name == query)
@@ -247,9 +296,13 @@ def ranked_hint_badness():
     for query in JOB_QUERIES_SORTED:
         ranks = query_hint_ranks(query)
         for join_hint, scan_hint, rank in ranks:
-            query_ranks[(join_hint, scan_hint)] = query_ranks.get((join_hint, scan_hint), [])
+            query_ranks[(join_hint, scan_hint)] = query_ranks.get(
+                (join_hint, scan_hint), []
+            )
             query_ranks[(join_hint, scan_hint)].append(rank)
-    worst_rankings = list(sorted(query_ranks.items(), key=lambda x: (max(x[1]), median(x[1]))))
+    worst_rankings = list(
+        sorted(query_ranks.items(), key=lambda x: (max(x[1]), median(x[1])))
+    )
     return [x[0] for x in worst_rankings]
 
 
@@ -265,9 +318,9 @@ def plot_runtimes_hist():
 
     runtimes = [
         p.runtime_avg
-        for p in BaoPlan.select(fn.AVG(BaoPlan.runtime_secs).alias("runtime_avg")).group_by(
-            BaoPlan.query_name, BaoPlan.join_hint, BaoPlan.scan_hint
-        )
+        for p in BaoPlan.select(
+            fn.AVG(BaoPlan.runtime_secs).alias("runtime_avg")
+        ).group_by(BaoPlan.query_name, BaoPlan.join_hint, BaoPlan.scan_hint)
     ]
     values, bins, bars = plt.hist(runtimes)
     plt.bar_label(bars)
@@ -283,7 +336,14 @@ def top_bot_improvement(
 ):
     workload_set_obj = get_workload_set(workload_set)
     improvements = sorted(
-        [(query, bao_optimal_time(query, workload_set) / postgres_time(query)) for query in workload_set_obj.queries],
+        [
+            (
+                query,
+                bao_optimal_time(query, workload_set)
+                / postgres_time(query, workload_set),
+            )
+            for query in workload_set_obj.queries
+        ],
         key=lambda x: x[1],
     )
     top = [query for query, _ in improvements[:n]]
@@ -297,7 +357,10 @@ def top_pg_runtime(
 ):
     workload_set_obj = get_workload_set(workload_set)
     runtimes = sorted(
-        [(query, postgres_time(query)) for query in workload_set_obj.queries],
+        [
+            (query, postgres_time(query, workload_set))
+            for query in workload_set_obj.queries
+        ],
         key=lambda x: x[1],
     )
     return [query for query, _ in runtimes[-n:]]
@@ -335,7 +398,9 @@ def show_ceb_workload():
         template = match.group(1)
         template_counts.setdefault(template, 0)
         template_counts[template] += 1
-    for template, count in sorted(template_counts.items(), key=lambda x: (int(x[0][:-1]), x[0][-1])):
+    for template, count in sorted(
+        template_counts.items(), key=lambda x: (int(x[0][:-1]), x[0][-1])
+    ):
         print(f"{template}: {count}")
 
 
@@ -356,5 +421,191 @@ def write_ceb_workload_queries():
             f.write(query + "\n")
 
 
+@app.command()
+def check_workload_pg(workload_set: str = typer.Option()):
+    workload_set_obj = get_workload_set(workload_set)
+    for query in workload_set_obj.queries:
+        print(f"{query}: {postgres_time(query, workload_set)}")
+
+
+def invert_hint(hint: str) -> tuple[set[BaoJoinHint], set[BaoScanHint]]:
+    all_join_hints = set(BaoJoinHint)
+    all_scan_hints = set(BaoScanHint)
+    match hint:
+        case "hashjoin":
+            return {
+                BaoJoinHint.NoMerge,
+                BaoJoinHint.NoNestedLoops,
+                BaoJoinHint.NoMergeNoNestedLoops,
+            }, all_scan_hints
+        case "mergejoin":
+            return {
+                BaoJoinHint.NoHash,
+                BaoJoinHint.NoNestedLoops,
+                BaoJoinHint.NoHashNoNestedLoops,
+            }, all_scan_hints
+        case "nestloop":
+            return {
+                BaoJoinHint.NoHash,
+                BaoJoinHint.NoMerge,
+                BaoJoinHint.NoHashNoMerge,
+            }, all_scan_hints
+        case "indexonlyscan":
+            return all_join_hints, {
+                BaoScanHint.NoIndex,
+                BaoScanHint.NoSeq,
+                BaoScanHint.NoIndexNoSeq,
+            }
+        case "indexscan":
+            return all_join_hints, {
+                BaoScanHint.NoSeq,
+                BaoScanHint.NoIndexOnly,
+                BaoScanHint.NoSeqNoIndexOnly,
+            }
+        case "seqscan":
+            return all_join_hints, {
+                BaoScanHint.NoIndex,
+                BaoScanHint.NoIndexOnly,
+                BaoScanHint.NoIndexNoIndexOnly,
+            }
+        case _:
+            raise ValueError(f"Unknown hint: {hint}")
+
+
+def combine_join_hints(join_hints: set[BaoJoinHint]) -> BaoJoinHint:
+    if len(join_hints) == 1:
+        return join_hints.pop()
+    elif join_hints in [
+        {BaoJoinHint.NoHash, BaoJoinHint.NoMerge, BaoJoinHint.NoHashNoMerge},
+        {BaoJoinHint.NoHash, BaoJoinHint.NoMerge},
+    ]:
+        return BaoJoinHint.NoHashNoMerge
+    elif join_hints in [
+        {
+            BaoJoinHint.NoHash,
+            BaoJoinHint.NoNestedLoops,
+            BaoJoinHint.NoHashNoNestedLoops,
+        },
+        {BaoJoinHint.NoHash, BaoJoinHint.NoNestedLoops},
+    ]:
+        return BaoJoinHint.NoHashNoNestedLoops
+    elif join_hints in [
+        {
+            BaoJoinHint.NoMerge,
+            BaoJoinHint.NoNestedLoops,
+            BaoJoinHint.NoMergeNoNestedLoops,
+        },
+        {BaoJoinHint.NoMerge, BaoJoinHint.NoNestedLoops},
+    ]:
+        return BaoJoinHint.NoMergeNoNestedLoops
+    elif len(join_hints) == 0:
+        return BaoJoinHint.NoHint
+    else:
+        raise ValueError(f"Can't combine join hints: {join_hints}")
+
+
+def combine_scan_hints(scan_hints: set[BaoScanHint]) -> BaoScanHint:
+    if len(scan_hints) == 1:
+        return scan_hints.pop()
+    elif scan_hints in [
+        {BaoScanHint.NoIndex, BaoScanHint.NoSeq, BaoScanHint.NoIndexNoSeq},
+        {BaoScanHint.NoIndex, BaoScanHint.NoSeq},
+    ]:
+        return BaoScanHint.NoIndexNoSeq
+    elif scan_hints in [
+        {
+            BaoScanHint.NoIndex,
+            BaoScanHint.NoIndexOnly,
+            BaoScanHint.NoIndexNoIndexOnly,
+        },
+        {BaoScanHint.NoIndex, BaoScanHint.NoIndexOnly},
+    ]:
+        return BaoScanHint.NoIndexNoIndexOnly
+    elif scan_hints in [
+        {
+            BaoScanHint.NoSeq,
+            BaoScanHint.NoIndexOnly,
+            BaoScanHint.NoSeqNoIndexOnly,
+        },
+        {BaoScanHint.NoSeq, BaoScanHint.NoIndexOnly},
+    ]:
+        return BaoScanHint.NoSeqNoIndexOnly
+    elif len(scan_hints) == 0:
+        return BaoScanHint.NoHint
+    else:
+        raise ValueError(f"Can't combine scan hints: {scan_hints}")
+
+
+def limeqo_hint_order() -> list[tuple[BaoJoinHint, BaoScanHint]]:
+    limeqo_hints = [(BaoJoinHint.NoHint, BaoScanHint.NoHint)]
+    for hint_str in [
+        "hashjoin,indexonlyscan",
+        "hashjoin,indexonlyscan,indexscan",
+        "hashjoin,indexonlyscan,indexscan,mergejoin",
+        "hashjoin,indexonlyscan,indexscan,mergejoin,nestloop",
+        "hashjoin,indexonlyscan,indexscan,mergejoin,seqscan",
+        "hashjoin,indexonlyscan,indexscan,nestloop",
+        "hashjoin,indexonlyscan,indexscan,nestloop,seqscan",
+        "hashjoin,indexonlyscan,indexscan,seqscan",
+        "hashjoin,indexonlyscan,mergejoin",
+        "hashjoin,indexonlyscan,mergejoin,nestloop",
+        "hashjoin,indexonlyscan,mergejoin,nestloop,seqscan",
+        "hashjoin,indexonlyscan,mergejoin,seqscan",
+        "hashjoin,indexonlyscan,nestloop",
+        "hashjoin,indexonlyscan,nestloop,seqscan",
+        "hashjoin,indexonlyscan,seqscan",
+        "hashjoin,indexscan",
+        "hashjoin,indexscan,mergejoin",
+        "hashjoin,indexscan,mergejoin,nestloop",
+        "hashjoin,indexscan,mergejoin,nestloop,seqscan",
+        "hashjoin,indexscan,mergejoin,seqscan",
+        "hashjoin,indexscan,nestloop",
+        "hashjoin,indexscan,nestloop,seqscan",
+        "hashjoin,indexscan,seqscan",
+        "hashjoin,mergejoin,nestloop,seqscan",
+        "hashjoin,mergejoin,seqscan",
+        "hashjoin,nestloop,seqscan",
+        "hashjoin,seqscan",
+        "indexonlyscan,indexscan,mergejoin",
+        "indexonlyscan,indexscan,mergejoin,nestloop",
+        "indexonlyscan,indexscan,mergejoin,nestloop,seqscan",
+        "indexonlyscan,indexscan,mergejoin,seqscan",
+        "indexonlyscan,indexscan,nestloop",
+        "indexonlyscan,indexscan,nestloop,seqscan",
+        "indexonlyscan,mergejoin",
+        "indexonlyscan,mergejoin,nestloop",
+        "indexonlyscan,mergejoin,nestloop,seqscan",
+        "indexonlyscan,mergejoin,seqscan",
+        "indexonlyscan,nestloop",
+        "indexonlyscan,nestloop,seqscan",
+        "indexscan,mergejoin",
+        "indexscan,mergejoin,nestloop",
+        "indexscan,mergejoin,nestloop,seqscan",
+        "indexscan,mergejoin,seqscan",
+        "indexscan,nestloop",
+        "indexscan,nestloop,seqscan",
+        "mergejoin,nestloop,seqscan",
+        "mergejoin,seqscan",
+        "nestloop,seqscan",
+    ]:
+        hints = hint_str.split(",")
+        join_hints, scan_hints = zip(*[invert_hint(hint) for hint in hints])
+        unified_join_hints = set.intersection(*join_hints)
+        unified_scan_hints = set.intersection(*scan_hints)
+        limeqo_hints.append(
+            (
+                combine_join_hints(unified_join_hints),
+                combine_scan_hints(unified_scan_hints),
+            )
+        )
+    return limeqo_hints
+
+
 if __name__ == "__main__":
     app()
+    # hints = limeqo_hint_order()
+    # for join_hint, scan_hint in product(list(BaoJoinHint), list(BaoScanHint)):
+    #     if (join_hint, scan_hint) not in hints:
+    #         print("❌", join_hint, scan_hint)
+    #     else:
+    #         print("✅", join_hint, scan_hint)

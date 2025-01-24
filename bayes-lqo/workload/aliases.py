@@ -17,7 +17,7 @@ class AliasSet:
 
     aliases: set[tuple[str, int]]
 
-    def from_alias_counts(alias_counts: AliasCounts) -> "AliasSet":
+    def from_alias_counts(alias_counts: AliasCounts) -> AliasSet:
         return AliasSet(
             set(
                 (table, alias_num)

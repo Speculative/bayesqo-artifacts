@@ -1,9 +1,15 @@
+import asyncio
+import json
+import pdb
 import time
+from itertools import repeat
 from multiprocessing import Pool, cpu_count
+from subprocess import run
 from typing import Any, Iterable, Optional
 
 import psycopg2
 import psycopg2.pool
+
 from logger.log import l
 
 from .storage import PlanType
@@ -13,14 +19,17 @@ conn: Any = None
 
 def init_worker():
     global conn
-    conn = psycopg2.connect(host="172.17.0.2", database="so", user="so", password="so")
+    # conn = psycopg2.connect(host="172.17.0.2", database="so", user="so", password="so")
+    conn = psycopg2.connect(
+        host="172.17.0.2", database="postgres", user="imdb", password="imdb"
+    )
 
 
 def get_explain(args: tuple[str, PlanType]) -> Optional[str]:
     query, plan_type = args
     setting = ""
     # it's very important that these end with semicolons
-    match plan_type:
+    match (plan_type):
         case PlanType.NO_HASH_JOIN:
             setting = "SET enable_hashjoin TO off;"
         case PlanType.NO_LOOP_JOIN:

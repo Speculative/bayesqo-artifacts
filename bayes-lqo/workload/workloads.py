@@ -1,12 +1,22 @@
 import os
+import pdb
 import pickle
 from dataclasses import dataclass
 from enum import Enum
+from itertools import chain
 
 import networkx as nx
 import sqlglot
+from matplotlib import pyplot as plt
 
-from .schema import build_join_graph, build_query_join_graph, build_table_order
+from .schema import (
+    build_alias_join_graph,
+    build_join_graph,
+    build_join_graph_from_queries,
+    build_query_join_graph,
+    build_table_order,
+    get_all_columns,
+)
 
 
 class OracleCodec(Enum):
@@ -54,6 +64,9 @@ class WorkloadSpecDefinition:
     # Whether to prewarm the tables before running the query
     prewarm: bool
 
+    # Whether the query can have joins inlined
+    pg_hint_plan_join_order: bool
+
 
 @dataclass
 class WorkloadSpec(WorkloadSpecDefinition):
@@ -70,6 +83,7 @@ class WorkloadSpec(WorkloadSpecDefinition):
             definition.db,
             definition.db_user,
             definition.prewarm,
+            definition.pg_hint_plan_join_order,
             codec,
         )
 
@@ -85,6 +99,9 @@ class WorkloadDefinitionSet:
     # Retrieve query by name and combine with target language to create workload.
     queries: dict[str, WorkloadSpecDefinition]
 
+    # Table -> List of columns
+    all_columns: dict[str, list[str]]
+
     # Name of the database to execute against
     db: str
 
@@ -94,6 +111,9 @@ class WorkloadDefinitionSet:
     # Whether to prewarm the tables before running the query
     prewarm: bool
 
+    # Whether the query can have joins inlined
+    pg_hint_plan_join_order: bool
+
     def __init__(
         self,
         schema_file_path: str,
@@ -101,12 +121,23 @@ class WorkloadDefinitionSet:
         db="imdb",
         db_user="imdb",
         prewarm=False,
+        infer_join_keys_from_queries=False,
+        pg_hint_plan_join_order=False,
     ):
         self.tables = build_table_order(schema_file_path)
-        self.join_graph = build_join_graph(schema_file_path)
+        self.join_graph = (
+            build_join_graph(schema_file_path)
+            if not infer_join_keys_from_queries
+            else build_join_graph_from_queries(
+                schema_file_path, list(queries_sql.values())
+            )
+        )
+        self.all_columns = get_all_columns(schema_file_path)
         self.db = db
         self.db_user = db_user
         self.prewarm = prewarm
+        self.pg_hint_plan_join_order = pg_hint_plan_join_order
+
         self.queries = {}
         for query_name, query_sql in queries_sql.items():
             self.queries[query_name] = self.extract_query(query_sql, query_name)
@@ -125,10 +156,12 @@ class WorkloadDefinitionSet:
         new_aliases: dict[str, str] = {}
 
         join_exprs = [expr.args["from"]] + expr.args["joins"]
-        top_level_tables = [t for e in join_exprs for t in e.find_all(sqlglot.expressions.Table)]
+        top_level_tables = [
+            t for e in join_exprs for t in e.find_all(sqlglot.expressions.Table)
+        ]
         for table in top_level_tables:
-            if table.alias not in new_aliases:
-                if table.name not in alias_count:
+            if not table.alias in new_aliases:
+                if not table.name in alias_count:
                     alias_count[table.name] = 0
                 alias_count[table.name] += 1
                 alias = table.alias if table.alias else table.name
@@ -141,30 +174,50 @@ class WorkloadDefinitionSet:
 
         # Replace FROM, remove JOINs
         # sqlglot makes it awkward to create a bare From expr
-        new_from = sqlglot.expressions.from_("__REPLACE__").find(sqlglot.expressions.From)
-        normalized_expr.find(sqlglot.expressions.From).replace(new_from)
-        # for join in normalized_expr.find_all(sqlglot.expressions.Join):
-        for join in normalized_expr.args["joins"]:
-            assert isinstance(join, sqlglot.expressions.Join)
-            join.pop()
+        if not self.pg_hint_plan_join_order:
+            new_from = sqlglot.expressions.from_("__REPLACE__").find(
+                sqlglot.expressions.From
+            )
+            normalized_expr.find(sqlglot.expressions.From).replace(new_from)
+            for join in normalized_expr.args["joins"]:
+                assert isinstance(join, sqlglot.expressions.Join)
+                join.pop()
+
+        # Rewrite all tables in joins with aliases
+
+        for join in chain(
+            normalized_expr.find_all(sqlglot.expressions.From),
+            normalized_expr.find_all(sqlglot.expressions.Join),
+        ):
+            # Replace the table names with their aliases
+            for table in join.find_all(sqlglot.expressions.Table):
+                table_name = table.name
+                table_alias = new_aliases.get(table_name) or new_aliases.get(
+                    table.alias
+                )
+                table.replace(sqlglot.expressions.table_(table_name, alias=table_alias))
 
         # Rewrite all tables to use the right aliases
         for col in normalized_expr.find_all(sqlglot.expressions.Column):
             try:
                 col.replace(sqlglot.column(col.this.this, new_aliases[col.table]))
             except KeyError:
-                # pdb.set_trace()
                 # We may intentionally do not rewrite the aliases of tables not in the top-level join
                 # i.e. this is probably within a subquery
                 continue
 
         # Turn the modified query into a true format string
-        sql_template = normalized_expr.sql(pretty=True).replace("__REPLACE__", "{}")
+        if not self.pg_hint_plan_join_order:
+            sql_template = normalized_expr.sql(pretty=True).replace("__REPLACE__", "{}")
+        else:
+            sql_template = normalized_expr.sql(pretty=True)
 
         # Build the WorkloadSchema
         schema = WorkloadSchema(
             db_join_graph=self.join_graph,
-            query_join_graph=build_query_join_graph(normalized_expr),
+            query_join_graph=build_query_join_graph(
+                normalized_expr, self.all_columns, pause=True
+            ),
         )
 
         return WorkloadSpecDefinition(
@@ -175,6 +228,7 @@ class WorkloadDefinitionSet:
             self.db,
             self.db_user,
             self.prewarm,
+            self.pg_hint_plan_join_order,
         )
 
 
@@ -193,6 +247,7 @@ for file_name in os.listdir(IMDB_DIR):
             # Make the query name something like JOB_1A
             imdb_queries["JOB_" + file_name[:-4].upper()] = query_file.read()
 IMDB_WORKLOAD_SET = WorkloadDefinitionSet(IMDB_SCHEMA_PATH, imdb_queries)
+# IMDB_WORKLOAD_SET = WorkloadDefinitionSet(IMDB_SCHEMA_PATH, {})
 
 # ======
 # CEB 3K
@@ -217,7 +272,9 @@ def load_ceb3k():
                 if file_name.endswith(".sql"):
                     with open(os.path.join(template_dir, file_name)) as query_file:
                         # Make the query name something like CEB_1A3
-                        ceb_3k_queries["CEB_" + file_name[:-4].upper()] = query_file.read()
+                        ceb_3k_queries["CEB_" + file_name[:-4].upper()] = (
+                            query_file.read()
+                        )
         CEB_3K_WORKLOAD_SET = WorkloadDefinitionSet(IMDB_SCHEMA_PATH, ceb_3k_queries)
 
         with open(spec_cahe_path, "wb") as f:
@@ -247,7 +304,9 @@ def load_ceb13k():
                 if file_name.endswith(".sql"):
                     with open(os.path.join(template_dir, file_name)) as query_file:
                         # Make the query name something like CEB_1A3
-                        ceb_13k_queries["CEB_" + file_name[:-4].upper()] = query_file.read()
+                        ceb_13k_queries["CEB_" + file_name[:-4].upper()] = (
+                            query_file.read()
+                        )
         CEB_13K_WORKLOAD_SET = WorkloadDefinitionSet(IMDB_SCHEMA_PATH, ceb_13k_queries)
 
         with open(spec_cache_path, "wb") as f:
@@ -262,6 +321,7 @@ STACK_DIR = os.path.join(os.path.dirname(__file__), "stack")
 STACK_SCHEMA_PATH = os.path.join(STACK_DIR, "schema.sql")
 SO_PAST_WORKLOAD_SET = WorkloadDefinitionSet(STACK_SCHEMA_PATH, {})
 SO_FUTURE_WORKLOAD_SET = WorkloadDefinitionSet(STACK_SCHEMA_PATH, {})
+SO_SHIFTED_WORKLOAD_SET = WorkloadDefinitionSet(STACK_SCHEMA_PATH, {})
 
 
 def load_so_past():
@@ -282,7 +342,9 @@ def load_so_past():
                 if file_name.endswith(".sql"):
                     with open(os.path.join(template_dir, file_name)) as query_file:
                         # Make the query name something like STACK_Q1-001
-                        stack_queries["STACK_" + file_name[:-4].upper()] = query_file.read()
+                        stack_queries["STACK_" + file_name[:-4].upper()] = (
+                            query_file.read()
+                        )
         SO_PAST_WORKLOAD_SET = WorkloadDefinitionSet(
             STACK_SCHEMA_PATH, stack_queries, db="so_past", db_user="so", prewarm=True
         )
@@ -309,7 +371,9 @@ def load_so_future():
                 if file_name.endswith(".sql"):
                     with open(os.path.join(template_dir, file_name)) as query_file:
                         # Make the query name something like STACK_Q1-001
-                        stack_queries["STACK_" + file_name[:-4].upper()] = query_file.read()
+                        stack_queries["STACK_" + file_name[:-4].upper()] = (
+                            query_file.read()
+                        )
         SO_FUTURE_WORKLOAD_SET = WorkloadDefinitionSet(
             STACK_SCHEMA_PATH, stack_queries, db="so_future", db_user="so", prewarm=True
         )
@@ -318,19 +382,86 @@ def load_so_future():
             pickle.dump(SO_FUTURE_WORKLOAD_SET, f)
 
 
+def load_so_shifted():
+    global SO_SHIFTED_WORKLOAD_SET
+
+    spec_cache_path = os.path.join(WORKLOAD_DEF_CACHE_DIR, "so_shifted_spec_cache.pkl")
+    if os.path.exists(spec_cache_path):
+        with open(spec_cache_path, "rb") as f:
+            SO_SHIFTED_WORKLOAD_SET = pickle.load(f)
+    else:
+        STACK_DIR = os.path.join(os.path.dirname(__file__), "stack")
+        stack_queries: dict[str, str] = {}
+        for template in os.listdir(STACK_DIR):
+            if not os.path.isdir(os.path.join(STACK_DIR, template)):
+                continue
+            template_dir = os.path.join(STACK_DIR, template)
+            for file_name in os.listdir(template_dir):
+                if file_name.endswith(".sql"):
+                    with open(os.path.join(template_dir, file_name)) as query_file:
+                        # Make the query name something like STACK_Q1-001
+                        stack_queries["STACK_" + file_name[:-4].upper()] = (
+                            query_file.read()
+                        )
+        SO_SHIFTED_WORKLOAD_SET = WorkloadDefinitionSet(
+            STACK_SCHEMA_PATH,
+            stack_queries,
+            db="so_shift",
+            db_user="so",
+            prewarm=True,
+        )
+
+        with open(spec_cache_path, "wb") as f:
+            pickle.dump(SO_SHIFTED_WORKLOAD_SET, f)
+
+
+# =====
+#  DSB
+# =====
+DSB_DIR = os.path.join(os.path.dirname(__file__), "dsb")
+DSB_SCHEMA_PATH = os.path.join(DSB_DIR, "schema.sql")
+DSB_WORKLOAD_SET = WorkloadDefinitionSet(DSB_SCHEMA_PATH, {})
+
+
+def load_dsb():
+    global DSB_WORKLOAD_SET
+
+    dsb_queries: dict[str, str] = {}
+    for template in os.listdir(DSB_DIR):
+        template_dir = os.path.join(DSB_DIR, template)
+        if not os.path.isdir(template_dir):
+            continue
+        for file_name in os.listdir(template_dir):
+            if file_name.endswith(".sql"):
+                with open(os.path.join(template_dir, file_name)) as query_file:
+                    # Make the query name something like DSB_013
+                    dsb_queries["DSB_" + file_name[5:-4].upper()] = query_file.read()
+    DSB_WORKLOAD_SET = WorkloadDefinitionSet(
+        DSB_SCHEMA_PATH,
+        dsb_queries,
+        db="dsb",
+        db_user="so",
+        prewarm=True,
+        infer_join_keys_from_queries=True,
+        pg_hint_plan_join_order=True,
+    )
+
+
 # Legacy workloads
-EASY_WORKLOAD = IMDB_WORKLOAD_SET.queries["JOB_1A"]
-HARD_WORKLOAD = IMDB_WORKLOAD_SET.queries["JOB_16B"]
-JOB_17F = IMDB_WORKLOAD_SET.queries["JOB_17F"]
-JOB_8C = IMDB_WORKLOAD_SET.queries["JOB_8C"]
-JOB_7C = IMDB_WORKLOAD_SET.queries["JOB_7C"]
-JOB_19D = IMDB_WORKLOAD_SET.queries["JOB_19D"]
-JOB_9D = IMDB_WORKLOAD_SET.queries["JOB_9D"]
-JOB_6F = IMDB_WORKLOAD_SET.queries["JOB_6F"]
+# EASY_WORKLOAD = IMDB_WORKLOAD_SET.queries["JOB_1A"]
+# HARD_WORKLOAD = IMDB_WORKLOAD_SET.queries["JOB_16B"]
+# JOB_17F = IMDB_WORKLOAD_SET.queries["JOB_17F"]
+# JOB_8C = IMDB_WORKLOAD_SET.queries["JOB_8C"]
+# JOB_7C = IMDB_WORKLOAD_SET.queries["JOB_7C"]
+# JOB_19D = IMDB_WORKLOAD_SET.queries["JOB_19D"]
+# JOB_9D = IMDB_WORKLOAD_SET.queries["JOB_9D"]
+# JOB_6F = IMDB_WORKLOAD_SET.queries["JOB_6F"]
 
 # Keep this at the end
 ALL_WORKLOADS = {
-    name.upper(): workload for name, workload in globals().items() if isinstance(workload, WorkloadSpecDefinition)
+    name.upper(): workload
+    for name, workload in globals().items()
+    if isinstance(workload, WorkloadSpecDefinition)
 }
 
 
@@ -353,11 +484,102 @@ def get_workload_set(workload_set: str) -> WorkloadDefinitionSet:
         if len(SO_FUTURE_WORKLOAD_SET.queries) == 0:
             load_so_future()
         return SO_FUTURE_WORKLOAD_SET
+    elif workload_set == "SO_SHIFTED":
+        if len(SO_SHIFTED_WORKLOAD_SET.queries) == 0:
+            load_so_shifted()
+        return SO_SHIFTED_WORKLOAD_SET
+    elif workload_set == "DSB":
+        if len(DSB_WORKLOAD_SET.queries) == 0:
+            load_dsb()
+        return DSB_WORKLOAD_SET
     else:
         raise ValueError(f"Unknown workload set {workload_set}")
 
 
 if __name__ == "__main__":
-    stack_workload_set = get_workload_set("SO_FUTURE")
-    print(stack_workload_set.queries["STACK_Q9-033"].query_template)
-    print(stack_workload_set.queries["STACK_Q9-033"].query_tables)
+    dsb_workload_set = get_workload_set("DSB")
+    print(len(dsb_workload_set.queries))
+
+    # import re
+
+    # def extract_query_num(query_name: str):
+    #     match = re.match(r"DSB_(\d+)_(SPJ_)?(\d+)", query_name)
+    #     template_num = match.group(1)
+    #     instance_num = match.group(3)
+    #     return (int(instance_num), int(template_num))
+
+    # for query in sorted(
+    #     dsb_workload_set.queries.keys(), key=lambda x: extract_query_num(x)
+    # ):
+    #     print(query)
+    # pdb.set_trace()
+
+    # ========================
+
+    # import difflib
+    # import re
+
+    # from db_eval.stack import workload_queries as stack_queries
+
+    # try:
+    #     from colorama import Back, Fore, Style, init
+
+    #     init()
+    # except ImportError:  # fallback so that the imported classes always exist
+
+    #     class ColorFallback:
+    #         __getattr__ = lambda self, name: ""
+
+    #     Fore = Back = Style = ColorFallback()
+
+    # def color_diff(diff):
+    #     for line in diff:
+    #         if line.startswith("+"):
+    #             yield Fore.GREEN + line + Fore.RESET
+    #         elif line.startswith("-"):
+    #             yield Fore.RED + line + Fore.RESET
+    #         elif line.startswith("^"):
+    #             yield Fore.BLUE + line + Fore.RESET
+    #         else:
+    #             yield line
+
+    # workload_set = get_workload_set("SO_FUTURE")
+
+    # so_50 = stack_queries(target=50, min_runtime=1.0)
+    # for query_name in so_50:
+    #     print()
+    #     print(query_name)
+    #     match = re.match(r"STACK_(Q\d+)-(\d+)", query_name)
+    #     template = match.group(1).lower()
+    #     query_sql = open(
+    #         os.path.join(STACK_DIR, template, f"{template}-{match.group(2)}.sql")
+    #     ).read()
+    #     expr = sqlglot.parse_one(query_sql, read="postgres")
+    #     unprocessed_query = expr.sql(pretty=True)
+
+    #     processed_query = workload_set.queries[query_name].query_template
+
+    #     for line in color_diff(
+    #         difflib.unified_diff(
+    #             unprocessed_query.split("\n"), processed_query.split("\n")
+    #         )
+    #     ):
+    #         print(line)
+
+    #     input()
+
+    # ========================
+
+    # nx.draw_networkx(dsb_workload_set.join_graph)
+    # plt.show()
+    # alias_join_graph = build_alias_join_graph(dsb_workload_set.join_graph, 3)
+    # nx.draw_networkx(alias_join_graph)
+    # plt.show()
+
+    # print(f"{dsb_workload_set.queries["DSB_072_0"].query_template}")
+    # print(f"{dsb_workload_set.queries["DSB_072_0"].query_tables}")
+
+    # for edge in IMDB_WORKLOAD_SET.join_graph.edges:
+    #     print(edge, IMDB_WORKLOAD_SET.join_graph.get_edge_data(*edge))
+    # nx.draw_networkx(IMDB_WORKLOAD_SET.join_graph)
+    # plt.show()

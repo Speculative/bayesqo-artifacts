@@ -2,6 +2,7 @@ import re
 from enum import StrEnum, auto
 
 import numpy as np
+
 from workload.workloads import IMDB_WORKLOAD_SET
 
 
@@ -54,10 +55,12 @@ class Aggregate(StrEnum):
     sum = auto()
     median = auto()
     p90 = auto()
+    avg = auto()
 
 
 AGG_FUNCS = {
     Aggregate.sum: np.sum,
     Aggregate.median: np.median,
     Aggregate.p90: lambda x: np.percentile(x, 90),
+    Aggregate.avg: np.mean,
 }
